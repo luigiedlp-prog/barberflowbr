@@ -1,0 +1,25 @@
+BarberFlowBR V4 — Aplicación del estilo de referencia
+
+- Se conserva la arquitectura y la lógica del proyecto.
+- Se actualiza principalmente la capa visual de Gestión y /reservar.
+- Gestión mantiene 4 secciones: Gestión, Clientes, Ganancias y Servicios.
+- No hay selector de idioma ni banderas emoji.
+- Se mantienen las fotos del catálogo y los logos.
+- WhatsApp rápido se mantiene funcional.
+- El logo circular se usa en la confirmación de reserva.
+- Los horarios siguen siendo los que devuelve /availability; no se agregó un límite artificial.
+
+Repositorio configurado: luigiedlp-prog/barberflowbr
+
+--- CORRECCIONES APLICADAS SOBRE ESTE PAQUETE ---
+Bugs de backend (regresión de condiciones de carrera, ya habían sido corregidos antes y volvieron en este V4):
+- cancelAppointment() (usada por /cancel del cliente y /admin/cancel): el UPDATE ahora lleva guard WHERE status='pending' y chequea filas afectadas antes de aplicar los efectos secundarios (borrar slots, sumar cancelaciones, notificar). Si el turno ya no estaba pendiente, responde 409 en vez de duplicar.
+- /admin/finish: mismo guard atómico antes de sumar visita/ganancia. Evita contar el mismo turno dos veces con doble clic o dos pestañas.
+- /admin/no-show: mismo guard atómico antes de sumar no_shows.
+- /login, /recover-info, /recover: el límite de 6 intentos cada 15 min ahora se reserva con un INSERT...SELECT...WHERE atómico (authReserve) en vez de "contar y después insertar", así no se puede eludir con fuerza bruta en paralelo.
+
+Ajustes visuales en /reservar:
+- Las descripciones de los servicios ya no se cortan a mitad de palabra ("...con b…"); ahora se muestran en 2 líneas completas.
+- El encabezado del paso "3 · Horario" ya no muestra la fecha cruda (2026-09-17); ahora usa el mismo formato lindo que los botones de fecha ("jue 17 · sept").
+
+Probado con una simulación de concurrencia local (no se pudo probar contra Cloudflare real por falta de red en el entorno de edición) y con captura de pantalla del HTML renderizado.
