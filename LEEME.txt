@@ -1,0 +1,23 @@
+BarberFlowBR V16 — ajuste visual
+
+Repositorio GitHub configurado: luigiedlp-prog/barberflowbr
+
+CAMBIOS:
+- Logo público mucho más grande y también visible en Gestión.
+- Fotos del catálogo ampliadas para que tengan más presencia.
+- Se mantiene la estructura, navegación y funciones existentes.
+- Las imágenes de GitHub llevan cache-buster para que los reemplazos sean detectados más fácilmente.
+
+GITHUB:
+- Subir/reemplazar logo.png en la raíz del repositorio.
+- Subir/reemplazar estas fotos en catalogo/:
+  corte-comun.jpg
+  corte-barba.jpg
+  global.jpg
+  mechas.jpg
+
+CLOUDFLARE:
+- Reemplazar el worker.js actual por este worker.js y hacer Deploy.
+
+IMPORTANTE:
+- Este paquete conserva el logo actual como archivo de prueba. Reemplazalo por tu logo.png con fondo transparente.
