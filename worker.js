@@ -80,7 +80,25 @@ function dateDiff(a,b){ return Math.round((new Date(`${a}T12:00:00Z`)-new Date(`
 function validDate(date){ const d=dateDiff(date,today()); return d>=0 && d<=2; }
 function currentMinutesAR(){ const parts=new Intl.DateTimeFormat('en-GB',{timeZone:'America/Argentina/Buenos_Aires',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date()); return Number(parts.find(x=>x.type==='hour')?.value||0)*60+Number(parts.find(x=>x.type==='minute')?.value||0); }
 function slotTimes(start,duration){ const out=[]; for(let m=minutes(start);m<minutes(start)+duration;m+=15) out.push(hhmm(m)); return out; }
-function exactScheduleTimes(day){ const arr=Array.isArray(day)?day:[]; if(!arr.every(x=>typeof x==='string')) return []; return [...new Set(arr.map(x=>String(x).slice(0,5)).filter(x=>/^([01]\d|2[0-3]):[0-5]\d$/.test(x)))].sort((a,b)=>minutes(a)-minutes(b)); }
+function exactScheduleTimes(day){
+  const arr=Array.isArray(day)?day:[];
+  const out=[];
+  for(const item of arr){
+    if(typeof item==='string'){
+      const t=String(item).slice(0,5);
+      if(/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) out.push(t);
+      continue;
+    }
+    // Compatibilidad con el calendario viejo: [[inicio,fin], ...].
+    // No generamos horarios intermedios. Solo conservamos los inicios que
+    // realmente estaban configurados como comienzo de cada bloque.
+    if(Array.isArray(item)&&item.length){
+      const t=String(item[0]||'').slice(0,5);
+      if(/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) out.push(t);
+    }
+  }
+  return [...new Set(out)].sort((a,b)=>minutes(a)-minutes(b));
+}
 async function scheduleFor(db,date){ const st=await settings(db); let sc=DEFAULTS.schedule; try{if(st?.schedule_json) sc=JSON.parse(st.schedule_json)||DEFAULTS.schedule}catch{} const dow=new Date(`${date}T12:00:00Z`).getUTCDay(); return sc[dow]||sc[String(dow)]||[]; }
 function startsFromSchedule(schedule,date,duration){ return exactScheduleTimes(schedule); }
 async function startsFor(db,date,duration){ if(!validDate(date)) return []; let out=startsFromSchedule(await scheduleFor(db,date),date,duration); if(date===today()){ const now=currentMinutesAR(); out=out.filter(t=>minutes(t)>=now); } return out; }
