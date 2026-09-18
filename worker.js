@@ -89,9 +89,9 @@ function exactScheduleTimes(day){
       if(/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) out.push(t);
       continue;
     }
-    // Compatibilidad con el calendario viejo: [[inicio,fin], ...].
-    // No generamos horarios intermedios. Solo conservamos los inicios que
-    // realmente estaban configurados como comienzo de cada bloque.
+    // Formato viejo: [[inicio,fin], ...]. Importante: NO se generan
+    // horarios intermedios. Solo se conserva el inicio que realmente estaba
+    // guardado en Gestión.
     if(Array.isArray(item)&&item.length){
       const t=String(item[0]||'').slice(0,5);
       if(/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) out.push(t);
@@ -99,9 +99,34 @@ function exactScheduleTimes(day){
   }
   return [...new Set(out)].sort((a,b)=>minutes(a)-minutes(b));
 }
-async function scheduleFor(db,date){ const st=await settings(db); let sc=DEFAULTS.schedule; try{if(st?.schedule_json) sc=JSON.parse(st.schedule_json)||DEFAULTS.schedule}catch{} const dow=new Date(`${date}T12:00:00Z`).getUTCDay(); return sc[dow]||sc[String(dow)]||[]; }
+function scheduleDayValue(sc,dow){
+  if(!sc || typeof sc!=='object') return {found:false,value:[]};
+  const names=['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
+  const namesNoAccent=['domingo','lunes','martes','miercoles','jueves','viernes','sabado'];
+  const keys=[dow,String(dow),names[dow],namesNoAccent[dow],names[dow]?.toUpperCase(),namesNoAccent[dow]?.toUpperCase()];
+  for(const k of keys){ if(Object.prototype.hasOwnProperty.call(sc,k)) return {found:true,value:sc[k]}; }
+  return {found:false,value:[]};
+}
+async function scheduleFor(db,date){
+  const st=await settings(db);
+  let sc=DEFAULTS.schedule;
+  let parsed=false;
+  try{ if(st?.schedule_json){ const raw=JSON.parse(st.schedule_json); if(raw&&typeof raw==='object'&&!Array.isArray(raw)){ sc=raw; parsed=true; } } }catch{}
+  const dow=new Date(`${date}T12:00:00Z`).getUTCDay();
+  const picked=scheduleDayValue(sc,dow);
+  // Si existe una configuración para ese día, respetarla incluso si está vacía.
+  // Solo usamos DEFAULTS cuando la base todavía no tiene un calendario válido.
+  if(picked.found) return picked.value;
+  if(parsed) return [];
+  return DEFAULTS.schedule[dow]||[];
+}
 function startsFromSchedule(schedule,date,duration){ return exactScheduleTimes(schedule); }
-async function startsFor(db,date,duration){ if(!validDate(date)) return []; let out=startsFromSchedule(await scheduleFor(db,date),date,duration); if(date===today()){ const now=currentMinutesAR(); out=out.filter(t=>minutes(t)>=now); } return out; }
+async function startsFor(db,date,duration){
+  if(!validDate(date)) return [];
+  let out=startsFromSchedule(await scheduleFor(db,date),date,duration);
+  if(date===today()){ const now=currentMinutesAR(); out=out.filter(t=>minutes(t)>=now); }
+  return out;
+}
 async function startInsideSchedule(db,date,time){ return exactScheduleTimes(await scheduleFor(db,date)).includes(String(time).slice(0,5)); }
 async function allowedStart(db,date,time,duration){ if(!await startInsideSchedule(db,date,time)) return false; return (await startsFor(db,date,duration)).includes(String(time).slice(0,5)); }
 async function ensureColumn(db,table,column,definition){
