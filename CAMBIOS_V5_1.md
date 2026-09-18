@@ -1,38 +1,21 @@
-# BarberFlowBR V5.1 — correcciones de UI, logos y horarios exactos
+# BarberFlowBR V5.1 — reparación de UI, logos y promociones
 
 ## Corregido
-- Gestión → Promociones vuelve a usar una tarjeta visual real (no texto suelto).
-- La tarjeta muestra tipo de promo, servicios, vigencia, estado y botones Editar / Activar-Desactivar / Eliminar.
-- El editor de promoción lista TODOS los servicios online configurados.
-- Tipo `Descuento por porcentaje` y tipo `2×1`.
-- En `2×1`, el porcentaje queda desactivado y se guarda como 0.
-- Se mantiene la activación/desactivación y vigencia automática de la promoción.
-- Se eliminaron las referencias que podían terminar mostrando `minutes is not defined` desde la interfaz de Gestión.
-- Logo y logo circular se sirven por rutas propias del Worker (`/logo.png`, `/logo-circular.png`).
-- Las fotos del catálogo se sirven por `/catalogo/...` mediante el Worker, evitando depender de que el navegador pueda leer directamente GitHub Raw.
-- Reservar mantiene las fotos montadas al seleccionar un servicio.
-- Reservar muestra Global y Mechas con 10% cuando la promoción activa corresponde.
+- Restaurada la tarjeta visual de cada promoción en Gestión; ya no depende solamente de CSS externo y conserva fondo, borde, badge y botones.
+- La tarjeta muestra nombre, servicios, vigencia, estado y mensaje.
+- La selección de servicios de una promoción sigue tomando **todos los servicios configurados**.
+- El editor mantiene los tipos **Descuento %** y **2×1**. En 2×1 el porcentaje queda desactivado y se guarda en 0.
+- Activar/desactivar una promoción usa `/admin/promotion/toggle` y no ejecuta ninguna función `minutes()` del navegador, evitando el error `minutes is not defined`.
+- Restauradas las rutas de logo y catálogo para Reservar/Gestión usando las URLs reales de GitHub configuradas en el worker, en vez de depender de `/logo.png` o `/catalogo/` dentro del HTML.
+- Eliminado el cache-busting con `Date.now()` de esas URLs para que las imágenes no se vuelvan a recrear al seleccionar un servicio.
+- Reservar mantiene el DOM de las tarjetas al seleccionar servicio (`pickService` actualiza selección/resumen/horarios sin reconstruir toda la pantalla).
+- El cálculo del 10% de la promoción sigue siendo server-side al crear la reserva.
 
-## Horarios: cambio importante
-La disponibilidad ya NO genera automáticamente horarios cada 15 minutos desde un rango.
-
-Gestión ahora permite cargar horas individuales por día:
-- `10:00`
-- `10:30`
-- `11:00`
-- etc.
-
-Reservar publica únicamente esas horas exactas.
-
-Las bases existentes que todavía tengan el formato antiguo `[inicio, fin]` no se convierten inventando horarios. Gestión muestra únicamente los extremos del rango antiguo para poder reconstruir el calendario exacto y guardarlo. Esto evita volver a generar 12:30, 12:45 u otras horas que Santi no haya cargado explícitamente.
-
-## Verificaciones realizadas
+## Verificación realizada
 - `node --check worker.js` OK.
-- HTML de Reservar extraído y renderizado localmente: promo banner + 4 servicios + 2 tarjetas promocionales.
-- Editor de promociones: 4 servicios detectados; al elegir `2×1`, el campo de porcentaje queda deshabilitado y en 0.
-- Gestión: tarjeta de promoción renderiza como tarjeta, con 3 acciones.
-- Sin `<style>` anidado en la sección de promociones.
-- No queda el texto literal `minutes is not defined` en el bundle.
+- ZIP validado con `unzip -t`.
+- Comprobación estática de placeholders de logos/catalogo, tarjeta de promoción, selector de servicios y endpoints de promoción.
+- Render local de las rutas HTML comprobado para la tarjeta de promoción y la estructura visual. Las imágenes remotas no pueden descargarse desde este entorno de prueba, pero las URLs quedan apuntando al repositorio real configurado.
 
-## Importante
-Este ZIP contiene el código corregido, pero no está desplegado automáticamente en el Worker publicado. Debe reemplazarse el `worker.js` del repositorio y desplegarse con la configuración habitual del proyecto.
+## Instalación
+Reemplazar el `worker.js` actual por el de este ZIP y desplegar con la configuración existente de `wrangler.toml`.
