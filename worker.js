@@ -230,12 +230,12 @@ async function cancelAppointment(db,a,{late=false,source='customer',reason=''}={
 }
 
 
-async function authReserve(db,request,kind,limit=6){
+async function authReserve(db,request,kind,limit=6,windowModifier='-15 minutes'){
   const ip=request.headers.get('CF-Connecting-IP')||'unknown';
   await db.prepare("DELETE FROM bf_auth_attempts WHERE created_at<datetime('now','-24 hours')").run();
   // Atómico: el INSERT solo se concreta si, en la MISMA sentencia, el conteo sigue bajo el límite.
   // Esto elimina la ventana de carrera entre "contar" e "insertar" de la versión anterior.
-  const r=await db.prepare(`INSERT INTO bf_auth_attempts(kind,ip,created_at) SELECT ?,?,CURRENT_TIMESTAMP WHERE (SELECT COUNT(*) FROM bf_auth_attempts WHERE kind=? AND ip=? AND created_at>datetime('now','-15 minutes'))<?`).bind(kind,ip,kind,ip,limit).run();
+  const r=await db.prepare(`INSERT INTO bf_auth_attempts(kind,ip,created_at) SELECT ?,?,CURRENT_TIMESTAMP WHERE (SELECT COUNT(*) FROM bf_auth_attempts WHERE kind=? AND ip=? AND created_at>datetime('now',?))<?`).bind(kind,ip,kind,ip,windowModifier,limit).run();
   return Number(r?.meta?.changes||0)===1;
 }
 async function authSuccess(db,request,kind){
@@ -294,6 +294,7 @@ if(!db) return json(500,{error:'Falta configurar el binding D1 llamado DB.'});
     }
 
     if(method==='POST'&&path==='/book'){
+      if(!(await authReserve(db,request,'book_daily',10,'-24 hours'))) return json(429,{error:'Alcanzaste el límite de turnos por día desde esta conexión. Probá de nuevo mañana o comunicate por WhatsApp.'});
       const {service:serviceId,date,time,name,whatsapp}=body; const s=await service(db,serviceId); const wa=cleanWA(whatsapp); const promotion=await activePromotion(db); const finalPrice=s?promoPrice(s,promotion):0;
       if(!s||!s.online||!date||!time||!String(name||'').trim()||!isValidWA(wa)) return json(400,{error:'Completá todos los datos con un WhatsApp argentino válido'});
       if(!validDate(date)) return json(400,{error:'Solo se pueden reservar hoy, mañana o pasado mañana'});
