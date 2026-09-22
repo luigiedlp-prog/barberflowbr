@@ -2,6 +2,10 @@ name = "barberflowbr"
 main = "worker.js"
 compatibility_date = "2026-09-10"
 
+[[d1_databases]]
+binding = "DB"
+database_id = "8db8a305-d91c-4948-9a17-ef7b01b3e8fd"
+
 [observability.logs]
 enabled = true
 head_sampling_rate = 1
