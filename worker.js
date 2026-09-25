@@ -461,6 +461,10 @@ if(!db) return json(500,{error:'Falta configurar el binding D1 llamado DB.'});
 
     if(method==='GET'&&path==='/public') return json(200,await publicData(db));
     if(method==='GET'&&path==='/push/key') return json(200,{key:pushReady(env)?env.VAPID_PUBLIC_KEY:null});
+    if(method==='GET'&&path==='/push/debug'){
+      const pub=String(env.VAPID_PUBLIC_KEY||''), priv=String(env.VAPID_PRIVATE_KEY||''), subj=String(env.VAPID_SUBJECT||'');
+      return json(200,{hasDB:!!env.DB,pubPresent:!!pub,pubLen:pub.length,privPresent:!!priv,privLen:priv.length,subjPresent:!!subj,subj});
+    }
 
     if(method==='GET'&&path==='/availability'){
       const u=new URL(request.url),date=u.searchParams.get('date'),serviceId=u.searchParams.get('service'),exclude=u.searchParams.get('exclude');
