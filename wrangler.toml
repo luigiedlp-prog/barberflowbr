@@ -11,3 +11,7 @@ enabled = true
 head_sampling_rate = 1
 invocation_logs = true
 persist = true
+
+# Cron cada 5 minutos: recordatorios, avisos push y reintentos de la sincronización con la barbería.
+[triggers]
+crons = ["*/5 * * * *"]

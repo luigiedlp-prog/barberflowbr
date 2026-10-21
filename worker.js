@@ -153,6 +153,7 @@ async function runScheduled(env){
   await dbInitOnce(db); await rolloverOnce(db);
   await createReminders(db);
   await flushPush(env);
+  await syncFlush(env,db).catch(e=>console.error('SYNC_FLUSH_ERROR',String(e?.message||e)));
 }
 const SW_JS = `self.addEventListener('install',()=>self.skipWaiting());
 self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));
@@ -272,6 +273,8 @@ async function migrate(db){
   await ensureColumn(db,'bf_clients','no_shows','INTEGER NOT NULL DEFAULT 0');
   await ensureColumn(db,'bf_daily_summaries','cancelled','INTEGER NOT NULL DEFAULT 0');
   await ensureColumn(db,'bf_appointments','reminded_at','TEXT');
+  await ensureColumn(db,'bf_appointments','ext_id','TEXT');
+  await db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_appt_ext ON bf_appointments(ext_id) WHERE ext_id IS NOT NULL').run();
   // Avisos push: los avisos que ya existían se marcan como enviados (pushed=1) para no mandar de golpe el historial viejo.
   if(await ensureColumn(db,'bf_notifications','pushed','INTEGER NOT NULL DEFAULT 0')) await db.prepare('UPDATE bf_notifications SET pushed=1').run();
   if(await ensureColumn(db,'bf_client_notifications','pushed','INTEGER NOT NULL DEFAULT 0')) await db.prepare('UPDATE bf_client_notifications SET pushed=1').run();
@@ -306,7 +309,11 @@ async function dbInit(db){
     `CREATE INDEX IF NOT EXISTS idx_blocks_date ON bf_blocks(date)`,
     `CREATE INDEX IF NOT EXISTS idx_notifications_seen ON bf_notifications(seen,created_at)`,
     `CREATE TABLE IF NOT EXISTS bf_push_subs (id TEXT PRIMARY KEY,role TEXT NOT NULL,client_id TEXT NOT NULL DEFAULT '',endpoint TEXT NOT NULL,p256dh TEXT NOT NULL,auth TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,UNIQUE(endpoint,role,client_id))`,
-    `CREATE INDEX IF NOT EXISTS idx_push_role ON bf_push_subs(role,client_id)`
+    `CREATE INDEX IF NOT EXISTS idx_push_role ON bf_push_subs(role,client_id)`,
+    `CREATE TABLE IF NOT EXISTS bf_sync_outbox (appt_id TEXT PRIMARY KEY,rev INTEGER NOT NULL,estado TEXT NOT NULL DEFAULT 'pendiente',intentos INTEGER NOT NULL DEFAULT 0,proximo INTEGER NOT NULL DEFAULT 0,ultimo_error TEXT)`,
+    `CREATE TRIGGER IF NOT EXISTS bf_sync_ai AFTER INSERT ON bf_appointments BEGIN INSERT INTO bf_sync_outbox(appt_id,rev) VALUES(NEW.id,CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)) ON CONFLICT(appt_id) DO UPDATE SET rev=MAX(excluded.rev,bf_sync_outbox.rev+1),estado='pendiente',intentos=0,proximo=0,ultimo_error=NULL; END`,
+    `CREATE TRIGGER IF NOT EXISTS bf_sync_au AFTER UPDATE OF client_id,service_id,service_name,price,duration,date,time,status,notes ON bf_appointments BEGIN INSERT INTO bf_sync_outbox(appt_id,rev) VALUES(NEW.id,CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)) ON CONFLICT(appt_id) DO UPDATE SET rev=MAX(excluded.rev,bf_sync_outbox.rev+1),estado='pendiente',intentos=0,proximo=0,ultimo_error=NULL; END`,
+    `CREATE TRIGGER IF NOT EXISTS bf_sync_cu AFTER UPDATE OF name,whatsapp ON bf_clients BEGIN INSERT INTO bf_sync_outbox(appt_id,rev) SELECT id,CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) FROM bf_appointments WHERE client_id=NEW.id AND status='pending' AND date>=date('now','-1 day') ON CONFLICT(appt_id) DO UPDATE SET rev=MAX(excluded.rev,bf_sync_outbox.rev+1),estado='pendiente',intentos=0,proximo=0,ultimo_error=NULL; END`
   ];
   await db.batch(statements.map(s=>db.prepare(s)));
   await migrate(db);
@@ -372,15 +379,15 @@ async function publicData(db){
   const st=await settings(db); const sv=await db.prepare('SELECT id,name,price,duration FROM bf_services WHERE online=1 ORDER BY name').all();
   let schedule=DEFAULTS.schedule;try{if(st.schedule_json)schedule=JSON.parse(st.schedule_json)||schedule}catch{} const promotion=await activePromotion(db); return {address:st.address,phone:st.phone,services:sv.results,schedule,days:3,today:today(),promotion};
 }
-async function canReserve(db,date,time,duration,excludeOwner=null){
+async function canReserve(db,date,time,duration,excludeOwner=null,extra=new Set()){
   if(!validDate(date)||!await allowedStart(db,date,time,duration)) return false;
   const slots=slotTimes(time,duration); if(slots.some(t=>minutes(t)>=1440)) return false;
   const occupied=excludeOwner ? await db.prepare('SELECT time FROM bf_slots WHERE date=? AND owner_id<>?').bind(date,excludeOwner).all() : await occupiedSlots(db,date);
   const blocked=new Set((occupied.results||[]).map(x=>String(x.time).slice(0,5)));
-  return slots.every(t=>!blocked.has(t));
+  return slots.every(t=>!blocked.has(t)&&!extra.has(t));
 }
 
-async function canReserveAny(db,date,time,duration,excludeOwner=null){
+async function canReserveAny(db,date,time,duration,excludeOwner=null,extra=new Set()){
   const schedule=await scheduleFor(db,date);
   if(date===today() && minutes(time)<currentMinutesAR()) return false;
   if(!schedule.some(([a,b])=>minutes(time)>=minutes(a)&&minutes(time)<=minutes(b))) return false;
@@ -388,7 +395,7 @@ async function canReserveAny(db,date,time,duration,excludeOwner=null){
   const slots=slotTimes(time,duration); if(slots.some(t=>minutes(t)>=1440)) return false;
   const q=excludeOwner ? await db.prepare('SELECT time FROM bf_slots WHERE date=? AND owner_id<>?').bind(date,excludeOwner).all() : await occupiedSlots(db,date);
   const blocked=new Set((q.results||[]).map(x=>String(x.time).slice(0,5)));
-  return slots.every(t=>!blocked.has(t));
+  return slots.every(t=>!blocked.has(t)&&!extra.has(t));
 }
 
 async function insertAppointment(db,{id,clientId,s,date,time,status='pending',source='online',notes=''}){
@@ -431,6 +438,133 @@ async function publicRateAllowed(db,request,kind,limit=30){
   return true;
 }
 
+// ═══════════════ Sincronización con la barbería (Worker ↔ Worker) ═══════════════
+// Secrets/variables en el Worker de Santi: SYNC_KEY (la misma que en la barbería), SYNC_URL (https://... del Worker de la barbería),
+// SYNC_ACTIVO=0 para cortar el vínculo sin perder nada. Cada cambio en un turno deja una fila en bf_sync_outbox (por triggers de D1);
+// se envía el turno COMPLETO tal como está en este momento, así que los reintentos y el orden no importan.
+const SYNC_TIMEOUT_MS = 4000;
+const syncKeyOk = env => !!(env && env.SYNC_KEY && String(env.SYNC_KEY).length >= 16 && String(env.SYNC_ACTIVO ?? '1') !== '0');
+const syncOn = env => syncKeyOk(env) && !!env.SYNC_URL;
+const syncBase = env => String(env.SYNC_URL).replace(/\/+$/, '');
+const syncHeaders = env => ({ 'content-type': 'application/json', 'x-sync-key': String(env.SYNC_KEY) });
+async function syncAuthOk(req, env) { if (!syncKeyOk(env)) return false; return (await sha256(req.headers.get('x-sync-key') || '')) === (await sha256(String(env.SYNC_KEY))); }
+async function syncSnapshot(db, id) {
+  const a = await db.prepare('SELECT a.*,c.id AS cid,c.name AS cname,c.whatsapp AS cwa FROM bf_appointments a JOIN bf_clients c ON c.id=a.client_id WHERE a.id=?').bind(id).first();
+  if (!a) return null;
+  return { origen: 'santi', external_id: a.id, fausto_id: a.ext_id || null,
+    cliente: { external_id: a.cid, name: a.cname, whatsapp: a.cwa },
+    turno: { date: a.date, time: String(a.time).slice(0, 5), duration: a.duration, service_id: a.service_id, service_name: a.service_name, price: a.price, status: a.status, source: a.source, notes: a.notes || '', late_cancel: a.late_cancel, cancel_reason: a.cancel_reason || '', created_at: a.created_at } };
+}
+async function syncFail(db, row, status, msg, retry, silent) {
+  const intentos = (row.intentos || 0) + 1, wait = Math.min(30 * 60000, 60000 * 2 ** Math.min(intentos, 5));
+  await db.prepare('UPDATE bf_sync_outbox SET estado=?,intentos=?,proximo=?,ultimo_error=? WHERE appt_id=? AND rev=?').bind(retry ? 'pendiente' : 'error', intentos, Date.now() + wait, String(msg).slice(0, 200), row.appt_id, row.rev).run();
+  if (!silent && (!retry || intentos === 5)) await notify(db, 'sync', status === 409 ? 'Choque con la agenda de la barbería' : 'No se pudo avisar a la barbería', `${String(msg).slice(0, 160)} (turno ${row.appt_id})`);
+  return { state: status === 409 ? 'conflict' : retry ? 'retry' : 'error', error: msg };
+}
+async function syncSendRow(env, db, row, opts = {}) {
+  const snap = await syncSnapshot(db, row.appt_id);
+  if (!snap) { await db.prepare('DELETE FROM bf_sync_outbox WHERE appt_id=?').bind(row.appt_id).run(); return { state: 'ok' }; }
+  snap.rev = row.rev;
+  let res, body = {};
+  try {
+    res = await fetch(syncBase(env) + '/api/sync/turno', { method: 'POST', headers: syncHeaders(env), body: JSON.stringify(snap), signal: AbortSignal.timeout(SYNC_TIMEOUT_MS) });
+    body = await res.json().catch(() => ({}));
+  } catch (e) { return syncFail(db, row, 0, 'Sin conexión con la barbería', true, opts.silent); }
+  if (res.ok) { await db.prepare("UPDATE bf_sync_outbox SET estado='ok',ultimo_error=NULL WHERE appt_id=? AND rev=?").bind(row.appt_id, row.rev).run(); return { state: 'ok', body }; }
+  return syncFail(db, row, res.status, body.error || 'Error ' + res.status, res.status >= 500 || [401, 403, 408, 429].includes(res.status), opts.silent);
+}
+async function syncFlush(env, db, limit = 8) {
+  if (!syncOn(env) || !db) return 0;
+  const rows = (await db.prepare("SELECT * FROM bf_sync_outbox WHERE estado='pendiente' AND proximo<=? AND rev>? ORDER BY rev LIMIT ?").bind(Date.now(), Date.now() - 7 * 864e5, limit).all()).results || [];
+  for (const r of rows) await syncSendRow(env, db, r).catch(e => console.error('SYNC_ERROR', String(e?.message || e)));
+  await db.prepare("DELETE FROM bf_sync_outbox WHERE estado='ok' AND rev<?").bind(Date.now() - 30 * 864e5).run();
+  return rows.length;
+}
+// Reserva pública: antes de confirmar, la barbería tiene que aceptar el turno (así no se pisa con uno cargado allá para Santi).
+async function syncBookGate(env, db, id) {
+  if (!syncOn(env)) return { state: 'off' };
+  const row = await db.prepare('SELECT * FROM bf_sync_outbox WHERE appt_id=?').bind(id).first();
+  return row ? syncSendRow(env, db, row, { silent: true }) : { state: 'off' };
+}
+// Horarios que la barbería ya tiene ocupados para Santi (turnos cargados allá + bloqueos). Si no responde, no bloquea la reserva.
+const rbCache = new Map();
+async function remoteBusy(env, date) {
+  if (!syncOn(env)) return new Set();
+  const hit = rbCache.get(date); if (hit && Date.now() - hit.t < 15000) return hit.s;
+  const out = new Set();
+  try {
+    const r = await fetch(`${syncBase(env)}/api/sync/ocupado?from=${date}&to=${date}`, { headers: syncHeaders(env), signal: AbortSignal.timeout(2500) });
+    if (!r.ok) return out;
+    for (const b of (await r.json()).busy || []) { if (b.date !== date) continue; for (let m = Math.floor(minutes(b.start) / 15) * 15; m < minutes(b.end); m += 15) out.add(hhmm(m)); }
+    rbCache.set(date, { t: Date.now(), s: out });
+  } catch (e) { console.error('SYNC_BUSY_ERROR', String(e?.message || e)); }
+  return out;
+}
+// La barbería cambió acá un turno de Santi (cancelar, mover, cerrar): se aplica sin volver a avisarle (no hay eco).
+async function syncCreate(db, b) {
+  const fid = String(b.fausto_id || ''), t = b.turno || {}, c = b.cliente || {};
+  if (!/^[\w-]{1,64}$/.test(fid)) return json(400, { error: 'fausto_id inválido' });
+  const dup = await db.prepare('SELECT id FROM bf_appointments WHERE ext_id=?').bind(fid).first();
+  if (dup) return json(200, { ok: true, id: dup.id, existing: true });
+  const time = String(t.time || '').slice(0, 5), dur = Math.round(+t.duration), price = Math.round(+t.price), wa = cleanWA(c.whatsapp), name = String(c.name || '').trim().slice(0, 120);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(t.date || '')) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time) || !(dur >= 1 && dur <= 600) || !(price >= 0) || !String(t.service_name || '').trim() || !name || wa.length < 8) return json(400, { error: 'Datos del turno inválidos' });
+  const sl = slotTimes(time, dur); if (sl.some(x => minutes(x) >= 1440)) return json(400, { error: 'El turno pasa de medianoche' });
+  const occ = new Set(((await occupiedSlots(db, t.date)).results || []).map(x => String(x.time).slice(0, 5)));
+  if (sl.some(x => occ.has(x))) return json(409, { error: 'Santi ya tiene un turno en ese horario en su sistema' });
+  const nm = String(t.service_name).trim().toLowerCase(), byName = (await db.prepare('SELECT id,name FROM bf_services').all()).results.find(x => String(x.name).trim().toLowerCase() === nm);
+  const sid = byName ? byName.id : 'fx_' + String(t.service_id || '').replace(/[^\w-]/g, '').slice(0, 30);
+  const old = await clientByWA(db, wa), cid = old?.id || uid('c'), id = uid('a'), nid = uid('n');
+  const stm = [];
+  if (!old) stm.push(db.prepare('INSERT INTO bf_clients(id,name,whatsapp) VALUES(?,?,?)').bind(cid, name, wa));
+  stm.push(db.prepare("INSERT INTO bf_appointments(id,client_id,service_id,service_name,price,duration,date,time,status,source,notes,ext_id) VALUES(?,?,?,?,?,?,?,?,'pending','barberia',?,?)").bind(id, cid, sid, String(t.service_name).trim().slice(0, 80), price, dur, t.date, time, String(t.notes || '').slice(0, 300), fid));
+  for (const x of sl) stm.push(db.prepare('INSERT INTO bf_slots(date,time,owner_id,kind) VALUES(?,?,?,?)').bind(t.date, x, id, 'appointment'));
+  stm.push(db.prepare('INSERT INTO bf_notifications(id,kind,title,body) VALUES(?,?,?,?)').bind(nid, 'booking', 'Nuevo turno (barbería)', `${name} · ${String(t.service_name).trim()} · ${t.date} · ${time}`));
+  try { await db.batch(stm); } catch (e) { return json(409, { error: 'Ese horario acaba de ocuparse en el sistema de Santi' }); }
+  await db.prepare("UPDATE bf_sync_outbox SET estado='ok',ultimo_error=NULL WHERE appt_id=?").bind(id).run();
+  return json(200, { ok: true, id });
+}
+async function syncInbound(db, b) {
+  if (b.op === 'create') return syncCreate(db, b);
+  const id = String(b.external_id || ''), a = await db.prepare('SELECT * FROM bf_appointments WHERE id=?').bind(id).first();
+  if (!a) return json(404, { error: 'Turno no encontrado en el sistema de Santi' });
+  if (a.status !== 'pending') return json(200, { ok: true, skipped: 'ya estaba cerrado' });
+  const quiet = () => db.prepare("UPDATE bf_sync_outbox SET estado='ok',ultimo_error=NULL WHERE appt_id=?").bind(id).run();
+  const hhm = String(a.time).slice(0, 5);
+  if (b.op === 'cancel') {
+    const r = await cancelAppointment(db, a, { late: !!b.late, source: 'barberia', reason: 'Cancelado desde la barbería' });
+    if (!r.ok) return json(409, { error: 'Ese turno ya había sido modificado en el sistema de Santi' });
+    await quiet(); return json(200, { ok: true });
+  }
+  if (b.op === 'no_show') {
+    const g = await db.prepare("UPDATE bf_appointments SET status='no_show',no_show_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'").bind(id).run();
+    if (Number(g?.meta?.changes || 0) !== 1) return json(409, { error: 'Ese turno ya había sido modificado' });
+    await db.batch([db.prepare('DELETE FROM bf_slots WHERE owner_id=?').bind(id), db.prepare('UPDATE bf_clients SET no_shows=no_shows+1 WHERE id=?').bind(a.client_id)]);
+    await quiet(); return json(200, { ok: true });
+  }
+  if (b.op === 'done') {
+    const g = await db.prepare("UPDATE bf_appointments SET status='done' WHERE id=? AND status='pending'").bind(id).run();
+    if (Number(g?.meta?.changes || 0) !== 1) return json(409, { error: 'Ese turno ya había sido modificado' });
+    const fin = b.amount != null && b.amount !== '' && Number.isFinite(+b.amount) && +b.amount >= 0 ? Math.round(+b.amount) : a.price;
+    await db.batch([db.prepare('DELETE FROM bf_slots WHERE owner_id=?').bind(id), db.prepare('UPDATE bf_appointments SET price=? WHERE id=?').bind(fin, id),
+      db.prepare('UPDATE bf_clients SET visits=visits+1,total_spent=total_spent+?,last_visit=? WHERE id=?').bind(fin, a.date, a.client_id),
+      db.prepare('INSERT INTO bf_daily_summaries(date,turns,revenue,cancelled) VALUES(?,?,?,0) ON CONFLICT(date) DO UPDATE SET turns=turns+1,revenue=revenue+excluded.revenue').bind(a.date, 1, fin)]);
+    await quiet(); return json(200, { ok: true });
+  }
+  if (b.op === 'move') {
+    const date = String(b.date || ''), time = String(b.time || '').slice(0, 5), dur = Math.round(+b.duration) || a.duration;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time) || dur < 1 || dur > 600) return json(400, { error: 'Fecha u hora inválida' });
+    if (dateDiff(date, today()) < 0 || dateDiff(date, today()) > 365) return json(400, { error: 'La fecha debe estar entre hoy y un año.' });
+    if (!await canReserveAny(db, date, time, dur, id)) return json(409, { error: 'Ese horario no está libre o está fuera del horario de Santi' });
+    const stm = [db.prepare('DELETE FROM bf_slots WHERE owner_id=?').bind(id), db.prepare('UPDATE bf_appointments SET date=?,time=?,duration=? WHERE id=? AND status=\'pending\'').bind(date, time, dur, id)];
+    for (const t of slotTimes(time, dur)) stm.push(db.prepare('INSERT INTO bf_slots(date,time,owner_id,kind) VALUES(?,?,?,?)').bind(date, t, id, 'appointment'));
+    stm.push(db.prepare('INSERT INTO bf_client_notifications(id,client_id,kind,title,body) VALUES(?,?,?,?,?)').bind(uid('cn'), a.client_id, 'move', 'Tu turno cambió', `Tu turno pasó al ${date} a las ${time}.`));
+    try { await db.batch(stm); } catch (e) { return json(409, { error: 'Ese horario acaba de ocuparse' }); }
+    await notify(db, 'move', 'La barbería movió un turno', `${a.service_name} · ${hhm} ${a.date} → ${time} ${date}`);
+    await quiet(); return json(200, { ok: true });
+  }
+  return json(400, { error: 'Operación desconocida' });
+}
+
 async function onRequest(context){
   const {request,env,params}=context;
   const db=env.DB;
@@ -459,6 +593,14 @@ if(!db) return json(500,{error:'Falta configurar el binding D1 llamado DB.'});
       }
     }
 
+    if(method==='POST'&&path==='/sync/inbound'){ if(!await syncAuthOk(request,env)) return json(401,{error:'Clave de sincronización inválida o sync apagado'}); return syncInbound(db,body); }
+    if(method==='GET'&&path==='/sync/ocupado'){
+      if(!await syncAuthOk(request,env)) return json(401,{error:'Clave de sincronización inválida o sync apagado'});
+      const u=new URL(request.url),from=u.searchParams.get('from')||today(),to=u.searchParams.get('to')||from;
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(from)||!/^\d{4}-\d{2}-\d{2}$/.test(to)||dateDiff(to,from)>31) return json(400,{error:'Rango inválido'});
+      return json(200,{ok:true,cells:((await db.prepare('SELECT date,time FROM bf_slots WHERE date BETWEEN ? AND ? ORDER BY date,time').bind(from,to).all()).results||[]).map(x=>({date:x.date,time:String(x.time).slice(0,5)}))});
+    }
+    if(method==='GET'&&path==='/sync/ping'){ if(!await syncAuthOk(request,env)) return json(401,{error:'Clave de sincronización inválida o sync apagado'}); return json(200,{ok:true}); }
     if(method==='GET'&&path==='/public') return json(200,await publicData(db));
     if(method==='GET'&&path==='/push/key') return json(200,{key:pushReady(env)?env.VAPID_PUBLIC_KEY:null});
     if(method==='GET'&&path==='/push/debug'){
@@ -475,7 +617,8 @@ if(!db) return json(500,{error:'Falta configurar el binding D1 llamado DB.'});
         ? await db.prepare('SELECT time FROM bf_slots WHERE date=? AND owner_id<>? ORDER BY time').bind(date,exclude).all()
         : await occupiedSlots(db,date);
       const blocked=new Set((occupied.results||[]).map(x=>String(x.time).slice(0,5)));
-      const free=times.filter(t=>slotTimes(t,s.duration).every(x=>minutes(x)<1440&&!blocked.has(x)));
+      const rb=await remoteBusy(env,date);
+      const free=times.filter(t=>slotTimes(t,s.duration).every(x=>minutes(x)<1440&&!blocked.has(x)&&!rb.has(x)));
       return json(200,{date,service:s.id,times:free});
     }
 
@@ -484,15 +627,22 @@ if(!db) return json(500,{error:'Falta configurar el binding D1 llamado DB.'});
       const {service:serviceId,date,time,name,whatsapp}=body; const s=await service(db,serviceId); const wa=cleanWA(whatsapp); const promotion=await activePromotion(db); const finalPrice=s?promoPrice(s,promotion):0;
       if(!s||!s.online||!date||!time||!String(name||'').trim()||!isValidWA(wa)) return json(400,{error:'Completá todos los datos con un WhatsApp argentino válido'});
       if(!validDate(date)) return json(400,{error:'Solo se pueden reservar hoy, mañana o pasado mañana'});
-      const id=uid('a'); const cid=uid('c'); const old=await clientByWA(db,wa); const clientId=old?.id||cid;
+      const id=uid('a'); const nid=uid('n'); const cid=uid('c'); const old=await clientByWA(db,wa); const clientId=old?.id||cid;
       const stm=[];
       if(!old) stm.push(db.prepare('INSERT INTO bf_clients(id,name,whatsapp) VALUES(?,?,?)').bind(clientId,String(name).trim(),wa));
       else stm.push(db.prepare('UPDATE bf_clients SET name=? WHERE id=?').bind(String(name).trim(),clientId));
-      if(!await canReserve(db,date,time,s.duration)) return json(409,{error:'Ese horario ya no está disponible'});
+      if(!await canReserve(db,date,time,s.duration,null,await remoteBusy(env,date))) return json(409,{error:'Ese horario ya no está disponible'});
       stm.push(db.prepare(`INSERT INTO bf_appointments(id,client_id,service_id,service_name,price,duration,date,time,status,source) VALUES(?,?,?,?,?,?,?,?,?,?)`).bind(id,clientId,s.id,s.name,finalPrice,s.duration,date,time,'pending','online'));
       for(const t of slotTimes(time,s.duration)) stm.push(db.prepare('INSERT INTO bf_slots(date,time,owner_id,kind) VALUES(?,?,?,?)').bind(date,t,id,'appointment'));
-      stm.push(db.prepare('INSERT INTO bf_notifications(id,kind,title,body) VALUES(?,?,?,?)').bind(uid('n'),'booking','Nuevo turno online',`${String(name).trim()} · ${s.name} · ${date} · ${time}`));
+      stm.push(db.prepare('INSERT INTO bf_notifications(id,kind,title,body) VALUES(?,?,?,?)').bind(nid,'booking','Nuevo turno online',`${String(name).trim()} · ${s.name} · ${date} · ${time}`));
       try { await db.batch(stm); } catch(e) { return json(409,{error:'Ese horario acaba de ser ocupado. Elegí otro.'}); }
+      const gate=await syncBookGate(env,db,id);
+      if(gate.state==='conflict'){
+        const undo=[db.prepare('DELETE FROM bf_slots WHERE owner_id=?').bind(id),db.prepare('DELETE FROM bf_appointments WHERE id=?').bind(id),db.prepare('DELETE FROM bf_notifications WHERE id=?').bind(nid),db.prepare('DELETE FROM bf_sync_outbox WHERE appt_id=?').bind(id)];
+        if(!old) undo.push(db.prepare('DELETE FROM bf_clients WHERE id=? AND NOT EXISTS(SELECT 1 FROM bf_appointments WHERE client_id=?)').bind(clientId,clientId));
+        await db.batch(undo); rbCache.delete(date);
+        return json(409,{error:'Ese horario ya no está disponible. Elegí otro.'});
+      }
       const st=await settings(db); return json(200,{id,service:s.name,price:finalPrice,originalPrice:s.price,promotion:promoApplies(promotion,s.id)?promotion:null,duration:s.duration,date,time,address:st.address,phone:st.phone});
     }
 
@@ -553,6 +703,17 @@ if(!db) return json(500,{error:'Falta configurar el binding D1 llamado DB.'});
 
     if(!(await isAdmin(request,db))) return json(401,{error:'No autorizado'});
 
+    if(method==='GET'&&path==='/admin/sync/estado'){
+      const c=(await db.prepare('SELECT estado,COUNT(*) AS n FROM bf_sync_outbox GROUP BY estado').all()).results||[];
+      const err=(await db.prepare("SELECT appt_id,estado,intentos,ultimo_error FROM bf_sync_outbox WHERE estado<>'ok' ORDER BY rev DESC LIMIT 10").all()).results||[];
+      let barberia=null;
+      if(new URL(request.url).searchParams.get('probar')&&syncOn(env)){ try{ const r=await fetch(syncBase(env)+'/api/sync/ping',{headers:syncHeaders(env),signal:AbortSignal.timeout(SYNC_TIMEOUT_MS)}); barberia={status:r.status,...await r.json().catch(()=>({}))}; }catch(e){ barberia={error:String(e?.message||e)}; } }
+      return json(200,{activo:syncOn(env),claveConfigurada:!!env.SYNC_KEY,urlConfigurada:!!env.SYNC_URL,conteo:Object.fromEntries(c.map(x=>[x.estado,x.n])),pendientesOErrores:err,barberia});
+    }
+    if(method==='POST'&&path==='/admin/sync/resync'){
+      const r=await db.prepare(`INSERT INTO bf_sync_outbox(appt_id,rev) SELECT id,? FROM bf_appointments WHERE date>=? ON CONFLICT(appt_id) DO UPDATE SET rev=MAX(excluded.rev,bf_sync_outbox.rev+1),estado='pendiente',intentos=0,proximo=0,ultimo_error=NULL`).bind(Date.now(),today()).run();
+      return json(200,{ok:true,encolados:Number(r?.meta?.changes||0)});
+    }
     if(method==='POST'&&path==='/admin/push/subscribe'){
       if(!pushReady(env))return json(503,{error:'Los avisos todavía no están configurados.'});
       const sub=cleanSub(body.subscription); if(!sub)return json(400,{error:'Suscripción inválida'});
@@ -570,7 +731,7 @@ if(!db) return json(500,{error:'Falta configurar el binding D1 llamado DB.'});
       const u=new URL(request.url),date=u.searchParams.get('date'),serviceId=u.searchParams.get('service'),exclude=u.searchParams.get('exclude')||null,s=await service(db,serviceId);
       if(!date||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(date)||!s)return json(400,{error:'Datos inválidos'});
       const days=dateDiff(date,today()); if(days<0||days>365)return json(400,{error:'La fecha debe estar entre hoy y un año.'});
-      const times=await startsFor(db,date,s.duration),free=[]; const occupied=exclude ? await db.prepare('SELECT time FROM bf_slots WHERE date=? AND owner_id<>?').bind(date,exclude).all() : await occupiedSlots(db,date); const blocked=new Set((occupied.results||[]).map(x=>String(x.time).slice(0,5))); for(const t of times) if(slotTimes(t,s.duration).every(x=>minutes(x)<1440&&!blocked.has(x))) free.push(t);
+      const times=await startsFor(db,date,s.duration),free=[]; const occupied=exclude ? await db.prepare('SELECT time FROM bf_slots WHERE date=? AND owner_id<>?').bind(date,exclude).all() : await occupiedSlots(db,date); const blocked=new Set((occupied.results||[]).map(x=>String(x.time).slice(0,5))); const rb=await remoteBusy(env,date); for(const t of times) if(slotTimes(t,s.duration).every(x=>minutes(x)<1440&&!blocked.has(x)&&!rb.has(x))) free.push(t);
       return json(200,{date,service:s.id,times:free});
     }
 
@@ -656,13 +817,13 @@ if(!db) return json(500,{error:'Falta configurar el binding D1 llamado DB.'});
       if(id){
         const old=await db.prepare('SELECT * FROM bf_appointments WHERE id=?').bind(id).first(); if(!old)return json(404,{error:'Turno no encontrado'});
         if(old.status!=='pending')return json(400,{error:'Solo se pueden editar turnos pendientes'});
-        if(!await canReserveAny(db,date,time,sv.duration,id))return json(409,{error:'Horario ocupado o fuera del horario configurado'});
+        if(!await canReserveAny(db,date,time,sv.duration,id,await remoteBusy(env,date)))return json(409,{error:'Horario ocupado o fuera del horario configurado'});
         const stm=[db.prepare('DELETE FROM bf_slots WHERE owner_id=?').bind(id),db.prepare(`UPDATE bf_appointments SET date=?,time=?,service_id=?,service_name=?,price=?,duration=?,status='pending',notes=? WHERE id=?`).bind(date,time,sv.id,sv.name,sv.price,sv.duration,notes,id)];
         for(const t of slotTimes(time,sv.duration))stm.push(db.prepare('INSERT INTO bf_slots(date,time,owner_id,kind) VALUES(?,?,?,?)').bind(date,t,id,'appointment'));
         try{await db.batch(stm)}catch(e){return json(409,{error:'No se pudo guardar el cambio porque el horario acaba de ocuparse.'});}
         return json(200,{ok:true});
       }
-      if(!clientId||!await canReserveAny(db,date,time,sv.duration))return json(409,{error:'Horario ocupado o fuera del horario configurado'});
+      if(!clientId||!await canReserveAny(db,date,time,sv.duration,null,await remoteBusy(env,date)))return json(409,{error:'Horario ocupado o fuera del horario configurado'});
       try{await insertAppointment(db,{id:uid('a'),clientId,s:sv,date,time,status:'pending',source:'manual',notes});}catch(e){return json(409,{error:'No se pudo crear el turno porque el horario acaba de ocuparse.'});}
       return json(200,{ok:true});
     }
@@ -718,7 +879,7 @@ if(!db) return json(500,{error:'Falta configurar el binding D1 llamado DB.'});
 }
 
 
-const PUSH_TRIGGER_PATHS = new Set(['/api/book','/api/cancel','/api/admin/cancel','/api/admin/block']);
+const PUSH_TRIGGER_PATHS = new Set(['/api/book','/api/cancel','/api/admin/cancel','/api/admin/block','/api/sync/inbound']);
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -727,6 +888,7 @@ export default {
       const raw = url.pathname.replace(/^\/api\/?/, "");
       const path = raw ? raw.split("/").filter(Boolean) : [];
       const res = await onRequest({ request, env, ctx, params: { path } });
+      if (request.method === "POST" && res.status < 400 && syncOn(env) && env.DB) ctx.waitUntil(syncFlush(env, env.DB).catch(e => console.error('SYNC_FLUSH_ERROR', String(e?.message || e))));
       if (request.method === "POST" && res.status < 400 && PUSH_TRIGGER_PATHS.has(url.pathname.replace(/\/+$/, ""))) {
         ctx.waitUntil(flushPush(env).catch(e => console.error('PUSH_FLUSH_ERROR', String(e?.message || e))));
       }
