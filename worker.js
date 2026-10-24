@@ -509,17 +509,16 @@ async function syncCreate(db, b) {
   const time = String(t.time || '').slice(0, 5), dur = Math.round(+t.duration), price = Math.round(+t.price), wa = cleanWA(c.whatsapp), name = String(c.name || '').trim().slice(0, 120);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(t.date || '')) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time) || !(dur >= 1 && dur <= 600) || !(price >= 0) || !String(t.service_name || '').trim() || !name || wa.length < 8) return json(400, { error: 'Datos del turno inválidos' });
   const sl = slotTimes(time, dur); if (sl.some(x => minutes(x) >= 1440)) return json(400, { error: 'El turno pasa de medianoche' });
-  const occ = new Set(((await occupiedSlots(db, t.date)).results || []).map(x => String(x.time).slice(0, 5)));
-  if (sl.some(x => occ.has(x))) return json(409, { error: 'Santi ya tiene un turno en ese horario en su sistema' });
+  // Sin bloqueos: la barbería puede cargar turnos al horario que quiera, aunque ya haya otro (sobreturno). Los horarios que ya eran de otro turno o bloqueo no se pisan.
   const nm = String(t.service_name).trim().toLowerCase(), byName = (await db.prepare('SELECT id,name FROM bf_services').all()).results.find(x => String(x.name).trim().toLowerCase() === nm);
   const sid = byName ? byName.id : 'fx_' + String(t.service_id || '').replace(/[^\w-]/g, '').slice(0, 30);
   const old = await clientByWA(db, wa), cid = old?.id || uid('c'), id = uid('a'), nid = uid('n');
   const stm = [];
   if (!old) stm.push(db.prepare('INSERT INTO bf_clients(id,name,whatsapp) VALUES(?,?,?)').bind(cid, name, wa));
   stm.push(db.prepare("INSERT INTO bf_appointments(id,client_id,service_id,service_name,price,duration,date,time,status,source,notes,ext_id) VALUES(?,?,?,?,?,?,?,?,'pending','barberia',?,?)").bind(id, cid, sid, String(t.service_name).trim().slice(0, 80), price, dur, t.date, time, String(t.notes || '').slice(0, 300), fid));
-  for (const x of sl) stm.push(db.prepare('INSERT INTO bf_slots(date,time,owner_id,kind) VALUES(?,?,?,?)').bind(t.date, x, id, 'appointment'));
+  for (const x of sl) stm.push(db.prepare('INSERT OR IGNORE INTO bf_slots(date,time,owner_id,kind) VALUES(?,?,?,?)').bind(t.date, x, id, 'appointment'));
   stm.push(db.prepare('INSERT INTO bf_notifications(id,kind,title,body) VALUES(?,?,?,?)').bind(nid, 'booking', 'Nuevo turno (barbería)', `${name} · ${String(t.service_name).trim()} · ${t.date} · ${time}`));
-  try { await db.batch(stm); } catch (e) { return json(409, { error: 'Ese horario acaba de ocuparse en el sistema de Santi' }); }
+  try { await db.batch(stm); } catch (e) { return json(500, { error: 'No se pudo guardar el turno en el sistema de Santi' }); }
   await db.prepare("UPDATE bf_sync_outbox SET estado='ok',ultimo_error=NULL WHERE appt_id=?").bind(id).run();
   return json(200, { ok: true, id });
 }
@@ -554,11 +553,10 @@ async function syncInbound(db, b) {
     const date = String(b.date || ''), time = String(b.time || '').slice(0, 5), dur = Math.round(+b.duration) || a.duration;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time) || dur < 1 || dur > 600) return json(400, { error: 'Fecha u hora inválida' });
     if (dateDiff(date, today()) < 0 || dateDiff(date, today()) > 365) return json(400, { error: 'La fecha debe estar entre hoy y un año.' });
-    if (!await canReserveAny(db, date, time, dur, id)) return json(409, { error: 'Ese horario no está libre o está fuera del horario de Santi' });
     const stm = [db.prepare('DELETE FROM bf_slots WHERE owner_id=?').bind(id), db.prepare('UPDATE bf_appointments SET date=?,time=?,duration=? WHERE id=? AND status=\'pending\'').bind(date, time, dur, id)];
-    for (const t of slotTimes(time, dur)) stm.push(db.prepare('INSERT INTO bf_slots(date,time,owner_id,kind) VALUES(?,?,?,?)').bind(date, t, id, 'appointment'));
+    for (const t of slotTimes(time, dur)) stm.push(db.prepare('INSERT OR IGNORE INTO bf_slots(date,time,owner_id,kind) VALUES(?,?,?,?)').bind(date, t, id, 'appointment'));
     stm.push(db.prepare('INSERT INTO bf_client_notifications(id,client_id,kind,title,body) VALUES(?,?,?,?,?)').bind(uid('cn'), a.client_id, 'move', 'Tu turno cambió', `Tu turno pasó al ${date} a las ${time}.`));
-    try { await db.batch(stm); } catch (e) { return json(409, { error: 'Ese horario acaba de ocuparse' }); }
+    try { await db.batch(stm); } catch (e) { return json(500, { error: 'No se pudo mover el turno en el sistema de Santi' }); }
     await notify(db, 'move', 'La barbería movió un turno', `${a.service_name} · ${hhm} ${a.date} → ${time} ${date}`);
     await quiet(); return json(200, { ok: true });
   }
