@@ -826,9 +826,9 @@ if(!db) return json(500,{error:'Falta configurar el binding D1 llamado DB.'});
       return json(200,{ok:true});
     }
     if(method==='POST'&&path==='/admin/cancel'){
-      const a=await db.prepare('SELECT * FROM bf_appointments WHERE id=?').bind(body.id).first(); if(!a||a.status!=='pending')return json(400,{error:'Solo se puede cancelar un turno pendiente'});
+      const a=await db.prepare('SELECT * FROM bf_appointments WHERE id=?').bind(body.id).first(); if(a&&a.status==='cancelled')return json(200,{ok:true,already:true}); if(!a||a.status!=='pending')return json(400,{error:'Solo se puede cancelar un turno pendiente'});
       const result=await cancelAppointment(db,a,{source:'admin',reason:String(body.reason||'Cancelación realizada por Santi').trim()});
-      if(!result.ok) return json(409,{error:'Ese turno ya había sido modificado por otra acción.'});
+      if(!result.ok){ const cur=await db.prepare('SELECT status FROM bf_appointments WHERE id=?').bind(a.id).first(); if(cur&&cur.status==='cancelled')return json(200,{ok:true,already:true}); return json(409,{error:'Ese turno ya había sido modificado por otra acción.'}); } // doble toque: si ya quedó cancelado, es éxito
       return json(200,{ok:true});
     }
     if(method==='POST'&&path==='/admin/no-show'){
